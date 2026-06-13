@@ -22,46 +22,45 @@ def send_telegram(msg: str):
     except Exception as e:
         print("Telegram error:", e)
 
-# ─── STEP 1: BINANCE CANDLES ──────────────────────────────
-def get_btc_candles(interval="5m", limit=60):
+# ─── STEP 1: KRAKEN API SE CANDLES ────────────────────────
+def get_btc_candles(interval_min=5, limit=60):
+    """
+    Kraken free API — no restrictions, no API key needed
+    interval: 5 = 5min, 15 = 15min
+    """
     try:
+        # Kraken interval in minutes
         url = (
-            f"https://api.binance.com/api/v3/klines"
-            f"?symbol=BTCUSDT&interval={interval}&limit={limit}"
+            f"https://api.kraken.com/0/public/OHLC"
+            f"?pair=XBTUSD&interval={interval_min}"
         )
         r    = requests.get(url, timeout=15)
         data = r.json()
 
-        # Validate response
-        if not isinstance(data, list) or len(data) == 0:
-            print(f"Binance ({interval}): Invalid response — {str(data)[:100]}")
+        if data.get("error"):
+            print(f"Kraken error: {data['error']}")
             return None, None, None, None
 
-        closes  = []
-        volumes = []
-        highs   = []
-        lows    = []
+        # Kraken returns: [time, open, high, low, close, vwap, volume, count]
+        candles = list(data["result"].values())[0]
 
-        for candle in data:
-            if not isinstance(candle, list) or len(candle) < 6:
-                continue
-            try:
-                closes.append(float(candle[4]))
-                volumes.append(float(candle[5]))
-                highs.append(float(candle[2]))
-                lows.append(float(candle[3]))
-            except (ValueError, TypeError):
-                continue
-
-        if len(closes) < 50:
-            print(f"Binance ({interval}): Not enough valid candles — got {len(closes)}")
+        if not candles or len(candles) < 50:
+            print(f"Kraken: Not enough candles — {len(candles)}")
             return None, None, None, None
 
-        print(f"Binance ({interval}): OK — {len(closes)} candles | Latest close: {closes[-1]:.2f}")
+        # Take last `limit` candles
+        candles = candles[-limit:]
+
+        closes  = [float(c[4]) for c in candles]
+        volumes = [float(c[6]) for c in candles]
+        highs   = [float(c[2]) for c in candles]
+        lows    = [float(c[3]) for c in candles]
+
+        print(f"Kraken ({interval_min}m): OK — {len(closes)} candles | Latest: ${closes[-1]:,.2f}")
         return closes, volumes, highs, lows
 
     except Exception as e:
-        print(f"Binance ({interval}) fetch error: {e}")
+        print(f"Kraken ({interval_min}m) error: {e}")
         return None, None, None, None
 
 # ─── STEP 2: EMA ──────────────────────────────────────────
@@ -102,7 +101,7 @@ def check_volume(volumes):
         return False, 0, 0
     avg = sum(volumes[-21:-1]) / 20
     cur = volumes[-1]
-    return cur > avg, round(cur, 2), round(avg, 2)
+    return cur > avg, round(cur, 4), round(avg, 4)
 
 # ─── STEP 6: SESSION ──────────────────────────────────────
 def get_session():
@@ -143,7 +142,7 @@ def calculate_levels(trend, price, highs, lows):
     return sl, tp1, tp2, 2.0
 
 # ─── STEP 8: SCORE ────────────────────────────────────────
-def calculate_score(priority, trend_ok, entry_ok, vol_ok, retest):
+def calculate_score(priority, entry_ok, vol_ok, retest):
     score   = 0
     reasons = []
 
@@ -157,9 +156,8 @@ def calculate_score(priority, trend_ok, entry_ok, vol_ok, retest):
         score += 1
         reasons.append("⚠️ Low priority (Asian)")
 
-    if trend_ok:
-        score += 2
-        reasons.append("✅ 15M Trend confirmed")
+    score += 2
+    reasons.append("✅ 15M Trend confirmed")
 
     if entry_ok:
         score += 2
@@ -214,21 +212,22 @@ def format_signal(direction, price, sl, tp1, tp2, rr, score,
 
 # ─── MAIN LOOP ────────────────────────────────────────────
 def main():
-    print("🚀 BTCUSD EMA 30/50 Bot Started")
+    print("🚀 BTCUSD EMA 30/50 Bot Started — Kraken API")
     send_telegram(
         "🚀 <b>BTCUSD Signal Bot Online!</b>\n"
         "📊 EMA 30/50 | 15M + 5M\n"
+        "📡 Data: Kraken API\n"
         "⏰ All day signals (except 12AM-6AM IST)\n"
         "Checking every 5 minutes..."
     )
 
-    last_signal       = {"time": None, "dir": None}
-    session_trades    = {}
+    last_signal    = {"time": None, "dir": None}
+    session_trades = {}
 
     while True:
         try:
             session, priority = get_session()
-            now = datetime.now(IST)
+            now     = datetime.now(IST)
             now_str = now.strftime("%H:%M")
 
             if session is None:
@@ -236,9 +235,9 @@ def main():
                 time.sleep(CHECK_INTERVAL)
                 continue
 
-            # Fetch candles
-            closes_5m,  vols_5m,  highs_5m,  lows_5m  = get_btc_candles("5m",  60)
-            closes_15m, vols_15m, highs_15m, lows_15m  = get_btc_candles("15m", 60)
+            # Fetch candles from Kraken
+            closes_5m,  vols_5m,  highs_5m,  lows_5m  = get_btc_candles(5,  60)
+            closes_15m, vols_15m, highs_15m, lows_15m  = get_btc_candles(15, 60)
 
             if closes_5m is None or closes_15m is None:
                 print(f"[{now_str}] Candle fetch failed — retry in 60s")
@@ -261,13 +260,13 @@ def main():
 
             # Volume
             vol_ok, cur_vol, avg_vol = check_volume(vols_5m)
-            vol_status = f"Strong ✅" if vol_ok else f"Weak ❌"
+            vol_status = "Strong ✅" if vol_ok else "Weak ❌"
 
             # Retest
             retest = (abs(price - ema30_5m) / price * 100 < 0.2) if ema30_5m else False
 
             # Score
-            score, reasons = calculate_score(priority, True, entry_ok, vol_ok, retest)
+            score, reasons = calculate_score(priority, entry_ok, vol_ok, retest)
 
             print(f"[{now_str}] BTC: ${price:,.0f} | {direction} | Score: {score}/10 | Entry: {entry_ok} | Vol: {vol_ok} | {session}")
 
@@ -285,7 +284,7 @@ def main():
                 time.sleep(CHECK_INTERVAL)
                 continue
 
-            # Duplicate check
+            # Duplicate check 30 min
             if (last_signal["time"] and
                 (now - last_signal["time"]).seconds < 1800 and
                 last_signal["dir"] == direction):
@@ -300,7 +299,7 @@ def main():
                 time.sleep(CHECK_INTERVAL)
                 continue
 
-            # Send
+            # Send signal
             msg = format_signal(
                 direction, price, sl, tp1, tp2, rr, score,
                 session, priority, ema30_5m, ema50_5m,
