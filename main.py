@@ -10,144 +10,122 @@ CHECK_INTERVAL   = 300  # 5 min
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
-# ─── STEP 1: BINANCE SE DATA LANA ─────────────────────────
+# ─── TELEGRAM ─────────────────────────────────────────────
+def send_telegram(msg: str):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    try:
+        requests.post(url, json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text":    msg,
+            "parse_mode": "HTML"
+        }, timeout=10)
+    except Exception as e:
+        print("Telegram error:", e)
+
+# ─── STEP 1: BINANCE CANDLES ──────────────────────────────
 def get_btc_candles(interval="5m", limit=60):
-    """
-    Binance free API se BTCUSDT candles lo
-    interval = "5m" ya "15m"
-    limit    = kitni candles chahiye
-    """
     try:
         url = (
             f"https://api.binance.com/api/v3/klines"
             f"?symbol=BTCUSDT&interval={interval}&limit={limit}"
         )
-        r = requests.get(url, timeout=10)
+        r    = requests.get(url, timeout=15)
         data = r.json()
 
-        closes  = [float(c[4]) for c in data]   # Close price
-        volumes = [float(c[5]) for c in data]   # Volume
-        highs   = [float(c[2]) for c in data]   # High
-        lows    = [float(c[3]) for c in data]   # Low
+        # Validate response
+        if not isinstance(data, list) or len(data) == 0:
+            print(f"Binance ({interval}): Invalid response — {str(data)[:100]}")
+            return None, None, None, None
 
-        print(f"[Binance] {interval} candles fetched: {len(closes)}")
+        closes  = []
+        volumes = []
+        highs   = []
+        lows    = []
+
+        for candle in data:
+            if not isinstance(candle, list) or len(candle) < 6:
+                continue
+            try:
+                closes.append(float(candle[4]))
+                volumes.append(float(candle[5]))
+                highs.append(float(candle[2]))
+                lows.append(float(candle[3]))
+            except (ValueError, TypeError):
+                continue
+
+        if len(closes) < 50:
+            print(f"Binance ({interval}): Not enough valid candles — got {len(closes)}")
+            return None, None, None, None
+
+        print(f"Binance ({interval}): OK — {len(closes)} candles | Latest close: {closes[-1]:.2f}")
         return closes, volumes, highs, lows
 
     except Exception as e:
-        print(f"Binance error ({interval}): {e}")
+        print(f"Binance ({interval}) fetch error: {e}")
         return None, None, None, None
 
-# ─── STEP 2: EMA CALCULATION ──────────────────────────────
+# ─── STEP 2: EMA ──────────────────────────────────────────
 def calculate_ema(prices, period):
-    """
-    EMA formula:
-    EMA = Price * (2/period+1) + Previous EMA * (1 - 2/period+1)
-    """
     if len(prices) < period:
         return None
     k   = 2 / (period + 1)
-    ema = sum(prices[:period]) / period   # First EMA = simple average
+    ema = sum(prices[:period]) / period
     for price in prices[period:]:
         ema = price * k + ema * (1 - k)
     return round(ema, 2)
 
-# ─── STEP 3: TREND CHECK (15M) ────────────────────────────
+# ─── STEP 3: TREND (15M) ──────────────────────────────────
 def get_trend(closes_15m):
-    """
-    15M EMA30 vs EMA50:
-    EMA30 > EMA50 = BULLISH
-    EMA30 < EMA50 = BEARISH
-    """
     ema30 = calculate_ema(closes_15m, 30)
     ema50 = calculate_ema(closes_15m, 50)
-
     if not ema30 or not ema50:
         return None, None, None
+    trend = "BULLISH" if ema30 > ema50 else "BEARISH"
+    return trend, ema30, ema50
 
-    if ema30 > ema50:
-        trend = "BULLISH"
-    elif ema30 < ema50:
-        trend = "BEARISH"
-    else:
-        trend = None
-
-    return trend, round(ema30, 2), round(ema50, 2)
-
-# ─── STEP 4: ENTRY CHECK (5M) ─────────────────────────────
+# ─── STEP 4: ENTRY (5M) ───────────────────────────────────
 def check_entry(closes_5m, trend):
-    """
-    5M conditions:
-    BUY:  EMA30 > EMA50 AND price > EMA30
-    SELL: EMA30 < EMA50 AND price < EMA30
-    """
     ema30 = calculate_ema(closes_5m, 30)
     ema50 = calculate_ema(closes_5m, 50)
-
     if not ema30 or not ema50:
         return False, None, None
-
-    price = closes_5m[-1]   # Latest close price
-
+    price = closes_5m[-1]
     if trend == "BULLISH":
-        entry_ok = (ema30 > ema50) and (price > ema30)
-    elif trend == "BEARISH":
-        entry_ok = (ema30 < ema50) and (price < ema30)
+        ok = (ema30 > ema50) and (price > ema30)
     else:
-        entry_ok = False
+        ok = (ema30 < ema50) and (price < ema30)
+    return ok, ema30, ema50
 
-    return entry_ok, round(ema30, 2), round(ema50, 2)
-
-# ─── STEP 5: VOLUME CHECK ─────────────────────────────────
+# ─── STEP 5: VOLUME ───────────────────────────────────────
 def check_volume(volumes):
-    """
-    Current volume > Average of last 20 candles?
-    """
     if len(volumes) < 21:
         return False, 0, 0
-    avg_vol     = sum(volumes[-21:-1]) / 20
-    current_vol = volumes[-1]
-    return current_vol > avg_vol, round(current_vol, 2), round(avg_vol, 2)
+    avg = sum(volumes[-21:-1]) / 20
+    cur = volumes[-1]
+    return cur > avg, round(cur, 2), round(avg, 2)
 
-# ─── STEP 6: SESSION (Dead hours avoid) ───────────────────
+# ─── STEP 6: SESSION ──────────────────────────────────────
 def get_session():
-    """
-    Sirf dead hours (12 AM - 6 AM IST) mein signal nahi
-    Baaki poore din signal milega
-    Priority bhi assign karo:
-    """
     now   = datetime.now(IST)
-    hour  = now.hour
     total = now.hour * 60 + now.minute
 
-    # Dead zone — no signal
-    if 0 <= hour < 6:
+    # Dead zone 12AM - 6AM IST
+    if 0 <= now.hour < 6:
         return None, None
 
-    # London Killzone — High priority
     if 12*60+30 <= total <= 15*60+30:
         return "London Killzone", "HIGH"
-
-    # NY Killzone — High priority
     if 18*60+30 <= total <= 21*60+30:
         return "New York Killzone", "HIGH"
-
-    # London Open — Medium
     if 10*60 <= total < 12*60+30:
         return "London Open", "MEDIUM"
-
-    # NY Open — Medium
     if 16*60 <= total < 18*60+30:
         return "NY Open", "MEDIUM"
 
-    # Asian — Low priority
     return "Asian Session", "LOW"
 
-# ─── STEP 7: SL / TP CALCULATION ──────────────────────────
+# ─── STEP 7: SL / TP ──────────────────────────────────────
 def calculate_levels(trend, price, highs, lows):
-    """
-    BUY:  SL = recent swing low,  TP = 1:1 and 1:2
-    SELL: SL = recent swing high, TP = 1:1 and 1:2
-    """
     if trend == "BULLISH":
         sl      = round(min(lows[-10:]), 2)
         sl_dist = price - sl
@@ -162,74 +140,51 @@ def calculate_levels(trend, price, highs, lows):
     if sl_dist <= 0:
         return None, None, None, None
 
-    rr = round(sl_dist * 2 / sl_dist, 1)
-    return sl, tp1, tp2, rr
+    return sl, tp1, tp2, 2.0
 
-# ─── STEP 8: SCORE SYSTEM ─────────────────────────────────
-def calculate_score(session_priority, trend_ok, entry_ok, vol_ok, retest):
+# ─── STEP 8: SCORE ────────────────────────────────────────
+def calculate_score(priority, trend_ok, entry_ok, vol_ok, retest):
     score   = 0
     reasons = []
 
-    # Session priority
-    if session_priority == "HIGH":
+    if priority == "HIGH":
         score += 3
         reasons.append("✅ High priority session (Killzone)")
-    elif session_priority == "MEDIUM":
+    elif priority == "MEDIUM":
         score += 2
         reasons.append("⚡ Medium priority session")
     else:
         score += 1
-        reasons.append("⚠️ Low priority session")
+        reasons.append("⚠️ Low priority (Asian)")
 
-    # 15M trend
     if trend_ok:
         score += 2
         reasons.append("✅ 15M Trend confirmed")
 
-    # 5M entry
     if entry_ok:
         score += 2
         reasons.append("✅ 5M Entry conditions met")
 
-    # Volume
     if vol_ok:
         score += 2
         reasons.append("✅ Volume above average")
     else:
         reasons.append("❌ Volume weak")
 
-    # EMA retest bonus
     if retest:
         score += 1
         reasons.append("✅ Price retesting EMA30")
 
     return score, reasons
 
-# ─── STEP 9: TELEGRAM ─────────────────────────────────────
-def send_telegram(msg: str):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try:
-        requests.post(url, json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text":    msg,
-            "parse_mode": "HTML"
-        }, timeout=10)
-    except Exception as e:
-        print("Telegram error:", e)
-
+# ─── STEP 9: FORMAT MESSAGE ───────────────────────────────
 def format_signal(direction, price, sl, tp1, tp2, rr, score,
                   session, priority, ema30_5m, ema50_5m,
                   ema30_15m, ema50_15m, vol_status, reasons):
 
     now_ist = datetime.now(IST).strftime("%d %b %Y | %I:%M %p IST")
     emoji   = "🟢" if direction == "BUY" else "🔴"
-
-    if score >= 8:
-        quality = "A+ — Strong Signal"
-    elif score >= 6:
-        quality = "B  — Good Setup"
-    else:
-        quality = "C  — Weak"
+    quality = "A+ Strong" if score >= 8 else "B Good" if score >= 6 else "C Weak"
 
     lines = [
         f"{emoji} <b>BTCUSD — {direction} SIGNAL</b>",
@@ -245,8 +200,8 @@ def format_signal(direction, price, sl, tp1, tp2, rr, score,
         f"📦 <b>Volume :</b> {vol_status}",
         f"🕐 <b>Session:</b> {session} [{priority}]",
         "━━━━━━━━━━━━━━━━━━━━━",
-        f"5M  EMA30: {ema30_5m}  | EMA50: {ema50_5m}",
-        f"15M EMA30: {ema30_15m} | EMA50: {ema50_15m}",
+        f"5M  → EMA30: {ema30_5m} | EMA50: {ema50_5m}",
+        f"15M → EMA30: {ema30_15m} | EMA50: {ema50_15m}",
         "━━━━━━━━━━━━━━━━━━━━━",
         "<b>Reasons:</b>",
     ]
@@ -262,93 +217,90 @@ def main():
     print("🚀 BTCUSD EMA 30/50 Bot Started")
     send_telegram(
         "🚀 <b>BTCUSD Signal Bot Online!</b>\n"
-        "📊 EMA 30/50 | 15M Trend + 5M Entry\n"
-        "⏰ Signals all day (except 12AM-6AM IST)\n"
-        "🔔 Priority: Killzone > NY/London Open > Asian"
+        "📊 EMA 30/50 | 15M + 5M\n"
+        "⏰ All day signals (except 12AM-6AM IST)\n"
+        "Checking every 5 minutes..."
     )
 
-    last_signal = {"time": None, "dir": None}
-    session_trade_count = {}
+    last_signal       = {"time": None, "dir": None}
+    session_trades    = {}
 
     while True:
         try:
             session, priority = get_session()
             now = datetime.now(IST)
+            now_str = now.strftime("%H:%M")
 
             if session is None:
-                print(f"[{now.strftime('%H:%M')} IST] Dead zone — sleeping")
+                print(f"[{now_str}] Dead zone — sleeping")
                 time.sleep(CHECK_INTERVAL)
                 continue
 
-            # ── Fetch candles ──
+            # Fetch candles
             closes_5m,  vols_5m,  highs_5m,  lows_5m  = get_btc_candles("5m",  60)
             closes_15m, vols_15m, highs_15m, lows_15m  = get_btc_candles("15m", 60)
 
             if closes_5m is None or closes_15m is None:
+                print(f"[{now_str}] Candle fetch failed — retry in 60s")
                 time.sleep(60)
                 continue
 
             price = closes_5m[-1]
 
-            # ── Step 2: Trend ──
+            # Trend
             trend, ema30_15m, ema50_15m = get_trend(closes_15m)
             if not trend:
-                print("Trend unclear — WAIT")
+                print(f"[{now_str}] Trend unclear — WAIT")
                 time.sleep(CHECK_INTERVAL)
                 continue
 
             direction = "BUY" if trend == "BULLISH" else "SELL"
 
-            # ── Step 3: Entry ──
+            # Entry
             entry_ok, ema30_5m, ema50_5m = check_entry(closes_5m, trend)
 
-            # ── Step 4: Volume ──
+            # Volume
             vol_ok, cur_vol, avg_vol = check_volume(vols_5m)
-            vol_status = f"Strong ✅ ({cur_vol:.1f} > avg {avg_vol:.1f})" if vol_ok else f"Weak ❌ ({cur_vol:.1f} < avg {avg_vol:.1f})"
+            vol_status = f"Strong ✅" if vol_ok else f"Weak ❌"
 
-            # ── EMA Retest check ──
-            retest = abs(price - ema30_5m) / price * 100 < 0.2 if ema30_5m else False
+            # Retest
+            retest = (abs(price - ema30_5m) / price * 100 < 0.2) if ema30_5m else False
 
-            # ── Score ──
-            score, reasons = calculate_score(priority, bool(trend), entry_ok, vol_ok, retest)
+            # Score
+            score, reasons = calculate_score(priority, True, entry_ok, vol_ok, retest)
 
-            print(f"[{now.strftime('%H:%M')} IST] BTC: ${price:,.0f} | {direction} | Score: {score}/10 | Session: {session}")
+            print(f"[{now_str}] BTC: ${price:,.0f} | {direction} | Score: {score}/10 | Entry: {entry_ok} | Vol: {vol_ok} | {session}")
 
-            # ── Min score check ──
+            # Min score
             min_score = 6 if priority in ["HIGH", "MEDIUM"] else 8
-            if score < min_score:
-                print(f"Score {score} < {min_score} — WAIT")
+            if score < min_score or not entry_ok:
+                print(f"[{now_str}] Score {score} < {min_score} or entry not met — WAIT")
                 time.sleep(CHECK_INTERVAL)
                 continue
 
-            if not entry_ok:
-                print("Entry conditions not met — WAIT")
+            # Max 2 trades per session per day
+            key = f"{session}_{now.strftime('%Y%m%d')}"
+            if session_trades.get(key, 0) >= 2:
+                print(f"[{now_str}] Max trades reached for {session}")
                 time.sleep(CHECK_INTERVAL)
                 continue
 
-            # ── Max 2 trades per session ──
-            session_key = f"{session}_{now.strftime('%Y%m%d')}"
-            if session_trade_count.get(session_key, 0) >= 2:
-                print(f"Max 2 trades reached for {session}")
-                time.sleep(CHECK_INTERVAL)
-                continue
-
-            # ── Duplicate check (30 min gap) ──
+            # Duplicate check
             if (last_signal["time"] and
                 (now - last_signal["time"]).seconds < 1800 and
                 last_signal["dir"] == direction):
-                print("Duplicate signal — skipped")
+                print(f"[{now_str}] Duplicate — skipped")
                 time.sleep(CHECK_INTERVAL)
                 continue
 
-            # ── SL / TP ──
+            # SL/TP
             sl, tp1, tp2, rr = calculate_levels(trend, price, highs_5m, lows_5m)
             if not sl:
-                print("Invalid SL — skip")
+                print(f"[{now_str}] Invalid SL — skip")
                 time.sleep(CHECK_INTERVAL)
                 continue
 
-            # ── Send signal ──
+            # Send
             msg = format_signal(
                 direction, price, sl, tp1, tp2, rr, score,
                 session, priority, ema30_5m, ema50_5m,
@@ -358,12 +310,11 @@ def main():
 
             last_signal["time"] = now
             last_signal["dir"]  = direction
-            session_trade_count[session_key] = session_trade_count.get(session_key, 0) + 1
-
-            print(f"✅ Signal sent: {direction} @ ${price:,.0f}")
+            session_trades[key] = session_trades.get(key, 0) + 1
+            print(f"[{now_str}] ✅ Signal sent: {direction} @ ${price:,.0f}")
 
         except Exception as e:
-            print(f"Error: {e}")
+            print(f"Loop error: {e}")
 
         time.sleep(CHECK_INTERVAL)
 
