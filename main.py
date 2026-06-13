@@ -10,45 +10,45 @@ CHECK_INTERVAL   = 300  # 5 min
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
+# ─── PROTECTION RULES ─────────────────────────────────────
+consecutive_losses = 0
+session_trades     = {}
+last_signal        = {"time": None, "dir": None}
+bot_paused         = False
+bot_pause_until    = None
+
 # ─── TELEGRAM ─────────────────────────────────────────────
 def send_telegram(msg: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
         requests.post(url, json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text":    msg,
+            "chat_id":    TELEGRAM_CHAT_ID,
+            "text":       msg,
             "parse_mode": "HTML"
         }, timeout=10)
     except Exception as e:
-        print("Telegram error:", e)
+        print(f"Telegram error: {e}")
 
-# ─── STEP 1: KRAKEN API SE CANDLES ────────────────────────
-def get_btc_candles(interval_min=5, limit=60):
+# ─── STEP 1: KRAKEN CANDLES ───────────────────────────────
+def get_candles(interval_min, limit=210):
     """
-    Kraken free API — no restrictions, no API key needed
-    interval: 5 = 5min, 15 = 15min
+    Kraken free API
+    interval: 5, 15, 60 (minutes)
+    Returns: closes, volumes, highs, lows
     """
     try:
-        # Kraken interval in minutes
-        url = (
-            f"https://api.kraken.com/0/public/OHLC"
-            f"?pair=XBTUSD&interval={interval_min}"
-        )
-        r    = requests.get(url, timeout=15)
-        data = r.json()
+        url = f"https://api.kraken.com/0/public/OHLC?pair=XBTUSD&interval={interval_min}"
+        r   = requests.get(url, timeout=15)
+        d   = r.json()
 
-        if data.get("error"):
-            print(f"Kraken error: {data['error']}")
+        if d.get("error"):
+            print(f"Kraken {interval_min}m error: {d['error']}")
             return None, None, None, None
 
-        # Kraken returns: [time, open, high, low, close, vwap, volume, count]
-        candles = list(data["result"].values())[0]
+        candles = list(d["result"].values())[0]
+        if len(candles) < 210:
+            print(f"Kraken {interval_min}m: only {len(candles)} candles")
 
-        if not candles or len(candles) < 50:
-            print(f"Kraken: Not enough candles — {len(candles)}")
-            return None, None, None, None
-
-        # Take last `limit` candles
         candles = candles[-limit:]
 
         closes  = [float(c[4]) for c in candles]
@@ -56,54 +56,50 @@ def get_btc_candles(interval_min=5, limit=60):
         highs   = [float(c[2]) for c in candles]
         lows    = [float(c[3]) for c in candles]
 
-        print(f"Kraken ({interval_min}m): OK — {len(closes)} candles | Latest: ${closes[-1]:,.2f}")
+        print(f"Kraken {interval_min}m: {len(closes)} candles | Latest: ${closes[-1]:,.2f}")
         return closes, volumes, highs, lows
 
     except Exception as e:
-        print(f"Kraken ({interval_min}m) error: {e}")
+        print(f"Kraken {interval_min}m fetch error: {e}")
         return None, None, None, None
 
 # ─── STEP 2: EMA ──────────────────────────────────────────
-def calculate_ema(prices, period):
+def ema(prices, period):
     if len(prices) < period:
         return None
-    k   = 2 / (period + 1)
-    ema = sum(prices[:period]) / period
-    for price in prices[period:]:
-        ema = price * k + ema * (1 - k)
-    return round(ema, 2)
+    k = 2 / (period + 1)
+    e = sum(prices[:period]) / period
+    for p in prices[period:]:
+        e = p * k + e * (1 - k)
+    return round(e, 2)
 
-# ─── STEP 3: TREND (15M) ──────────────────────────────────
-def get_trend(closes_15m):
-    ema30 = calculate_ema(closes_15m, 30)
-    ema50 = calculate_ema(closes_15m, 50)
-    if not ema30 or not ema50:
-        return None, None, None
-    trend = "BULLISH" if ema30 > ema50 else "BEARISH"
-    return trend, ema30, ema50
+# ─── STEP 3: RSI ──────────────────────────────────────────
+def rsi(closes, period=14):
+    if len(closes) < period + 1:
+        return None
+    gains, losses = [], []
+    for i in range(1, period + 1):
+        diff = closes[-period + i] - closes[-period + i - 1]
+        if diff >= 0:
+            gains.append(diff)
+            losses.append(0)
+        else:
+            gains.append(0)
+            losses.append(abs(diff))
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+    if avg_loss == 0:
+        return 100
+    rs  = avg_gain / avg_loss
+    return round(100 - (100 / (1 + rs)), 2)
 
-# ─── STEP 4: ENTRY (5M) ───────────────────────────────────
-def check_entry(closes_5m, trend):
-    ema30 = calculate_ema(closes_5m, 30)
-    ema50 = calculate_ema(closes_5m, 50)
-    if not ema30 or not ema50:
-        return False, None, None
-    price = closes_5m[-1]
-    if trend == "BULLISH":
-        ok = (ema30 > ema50) and (price > ema30)
-    else:
-        ok = (ema30 < ema50) and (price < ema30)
-    return ok, ema30, ema50
+# ─── STEP 4: SIDEWAYS CHECK ───────────────────────────────
+def is_sideways(closes, lookback=20, threshold=0.004):
+    recent = closes[-lookback:]
+    rng    = (max(recent) - min(recent)) / min(recent)
+    return rng < threshold
 
-# ─── STEP 5: VOLUME ───────────────────────────────────────
-def check_volume(volumes):
-    if len(volumes) < 21:
-        return False, 0, 0
-    avg = sum(volumes[-21:-1]) / 20
-    cur = volumes[-1]
-    return cur > avg, round(cur, 4), round(avg, 4)
-
-# ─── STEP 6: SESSION ──────────────────────────────────────
+# ─── STEP 5: SESSION ──────────────────────────────────────
 def get_session():
     now   = datetime.now(IST)
     total = now.hour * 60 + now.minute
@@ -123,194 +119,341 @@ def get_session():
 
     return "Asian Session", "LOW"
 
-# ─── STEP 7: SL / TP ──────────────────────────────────────
-def calculate_levels(trend, price, highs, lows):
-    if trend == "BULLISH":
-        sl      = round(min(lows[-10:]), 2)
-        sl_dist = price - sl
-        tp1     = round(price + sl_dist, 2)
-        tp2     = round(price + sl_dist * 2, 2)
+# ─── STEP 6: ENGULFING CANDLE ─────────────────────────────
+def is_engulfing(closes, opens=None):
+    """
+    Simple bullish/bearish engulfing check
+    Using close prices as proxy
+    """
+    if len(closes) < 3:
+        return None
+
+    prev_close = closes[-2]
+    prev_open  = closes[-3]
+    curr_close = closes[-1]
+    curr_open  = closes[-2]
+
+    prev_body = abs(prev_close - prev_open)
+    curr_body = abs(curr_close - curr_open)
+
+    # Bullish engulfing
+    if curr_close > curr_open and curr_body > prev_body and curr_close > prev_close:
+        return "BULLISH"
+
+    # Bearish engulfing
+    if curr_close < curr_open and curr_body > prev_body and curr_close < prev_close:
+        return "BEARISH"
+
+    return None
+
+# ─── MAIN ANALYSIS ────────────────────────────────────────
+def analyze():
+    # Fetch all timeframes
+    closes_1h,  vols_1h,  highs_1h,  lows_1h  = get_candles(60,  210)
+    closes_15m, vols_15m, highs_15m, lows_15m  = get_candles(15,  210)
+    closes_5m,  vols_5m,  highs_5m,  lows_5m   = get_candles(5,   60)
+
+    if closes_1h is None or closes_15m is None or closes_5m is None:
+        return None
+
+    price = closes_5m[-1]
+
+    # ── STEP 2: Master Trend (1H 200 EMA) ──
+    ema200_1h = ema(closes_1h, 200)
+    if not ema200_1h:
+        print("1H 200 EMA: Not enough data")
+        return None
+
+    dist_pct = abs(price - ema200_1h) / price * 100
+    if dist_pct < 0.5:
+        print(f"Price at 200 EMA — WAIT ({dist_pct:.2f}%)")
+        return None
+
+    if price > ema200_1h:
+        master_trend = "BULLISH"
     else:
-        sl      = round(max(highs[-10:]), 2)
-        sl_dist = sl - price
-        tp1     = round(price - sl_dist, 2)
-        tp2     = round(price - sl_dist * 2, 2)
+        master_trend = "BEARISH"
 
-    if sl_dist <= 0:
-        return None, None, None, None
+    # ── STEP 3: EMA Stack (15M) ──
+    ema20_15m  = ema(closes_15m, 20)
+    ema50_15m  = ema(closes_15m, 50)
+    ema200_15m = ema(closes_15m, 200)
 
-    return sl, tp1, tp2, 2.0
+    if not all([ema20_15m, ema50_15m, ema200_15m]):
+        print("15M EMAs: Not enough data")
+        return None
 
-# ─── STEP 8: SCORE ────────────────────────────────────────
-def calculate_score(priority, entry_ok, vol_ok, retest):
+    if master_trend == "BULLISH":
+        stack_ok = ema20_15m > ema50_15m > ema200_15m
+    else:
+        stack_ok = ema20_15m < ema50_15m < ema200_15m
+
+    if not stack_ok:
+        print(f"15M EMA Stack not aligned — WAIT")
+        return None
+
+    direction = "BUY" if master_trend == "BULLISH" else "SELL"
+
+    # ── STEP 4: RSI Filter (5M) ──
+    rsi_val = rsi(closes_5m, 14)
+    if rsi_val is None:
+        return None
+
+    if direction == "BUY":
+        rsi_ok = 45 <= rsi_val <= 65
+    else:
+        rsi_ok = 35 <= rsi_val <= 55
+
+    # ── STEP 5: Pullback to EMA (5M) ──
+    ema20_5m = ema(closes_5m, 20)
+    ema50_5m = ema(closes_5m, 50)
+
+    if not ema20_5m or not ema50_5m:
+        return None
+
+    dist_ema20 = abs(price - ema20_5m) / price * 100
+    dist_ema50 = abs(price - ema50_5m) / price * 100
+    pullback_ok = dist_ema20 < 0.3 or dist_ema50 < 0.5
+
+    # ── Candle direction confirm ──
+    if direction == "BUY":
+        candle_ok = closes_5m[-1] > closes_5m[-2]
+    else:
+        candle_ok = closes_5m[-1] < closes_5m[-2]
+
+    # ── STEP 6: Volume (1.5x average) ──
+    if len(vols_5m) >= 21:
+        avg_vol = sum(vols_5m[-21:-1]) / 20
+        cur_vol = vols_5m[-1]
+        vol_ok  = cur_vol > avg_vol * 1.5
+        vol_status = f"Strong ✅ ({cur_vol:.2f} vs avg {avg_vol:.2f})" if vol_ok else f"Weak ❌"
+    else:
+        vol_ok, vol_status = False, "Insufficient data"
+
+    # ── Sideways check ──
+    if is_sideways(closes_5m):
+        print("Sideways market — WAIT")
+        return None
+
+    # ── SCORE SYSTEM ──
     score   = 0
     reasons = []
 
-    if priority == "HIGH":
-        score += 3
-        reasons.append("✅ High priority session (Killzone)")
-    elif priority == "MEDIUM":
-        score += 2
-        reasons.append("⚡ Medium priority session")
-    else:
-        score += 1
-        reasons.append("⚠️ Low priority (Asian)")
-
+    # 1H trend (2 pts)
     score += 2
-    reasons.append("✅ 15M Trend confirmed")
+    reasons.append(f"✅ 1H Master Trend: {master_trend} (200 EMA: {ema200_1h:,.2f})")
 
-    if entry_ok:
-        score += 2
-        reasons.append("✅ 5M Entry conditions met")
+    # 15M EMA Stack (2 pts)
+    score += 2
+    reasons.append(f"✅ 15M EMA Stack aligned: EMA20({ema20_15m:,.0f}) {'>' if direction=='BUY' else '<'} EMA50({ema50_15m:,.0f}) {'>' if direction=='BUY' else '<'} EMA200({ema200_15m:,.0f})")
 
-    if vol_ok:
+    # RSI (2 pts)
+    if rsi_ok:
         score += 2
-        reasons.append("✅ Volume above average")
+        reasons.append(f"✅ RSI: {rsi_val} (valid zone)")
     else:
-        reasons.append("❌ Volume weak")
+        reasons.append(f"❌ RSI: {rsi_val} (out of zone)")
 
-    if retest:
+    # Pullback + Candle (2 pts)
+    if pullback_ok and candle_ok:
+        score += 2
+        reasons.append(f"✅ Pullback to EMA + candle confirmed")
+    elif pullback_ok:
         score += 1
-        reasons.append("✅ Price retesting EMA30")
+        reasons.append(f"⚡ Pullback to EMA (candle weak)")
 
-    return score, reasons
+    # Volume (1 pt)
+    if vol_ok:
+        score += 1
+        reasons.append(f"✅ Volume 1.5x above average")
+    else:
+        reasons.append(f"❌ Volume weak")
 
-# ─── STEP 9: FORMAT MESSAGE ───────────────────────────────
-def format_signal(direction, price, sl, tp1, tp2, rr, score,
-                  session, priority, ema30_5m, ema50_5m,
-                  ema30_15m, ema50_15m, vol_status, reasons):
+    # Session (1 pt)
+    session, priority = get_session()
+    if priority == "HIGH":
+        score += 1
+        reasons.append(f"✅ {session} — High priority")
+    elif priority == "MEDIUM":
+        score += 0.5
+        reasons.append(f"⚡ {session} — Medium priority")
 
+    print(f"Score: {score}/10 | Direction: {direction} | RSI: {rsi_val} | Vol: {vol_ok} | Pullback: {pullback_ok}")
+
+    # ── Min score ──
+    if score < 7:
+        print(f"Score {score} too low — WAIT")
+        return None
+
+    # ── SL / TP ──
+    if direction == "BUY":
+        sl      = round(min(lows_5m[-10:]), 2)
+        sl_dist = price - sl
+        tp1     = round(price + sl_dist, 2)
+        tp2     = round(price + sl_dist * 2, 2)
+        tp3     = round(price + sl_dist * 3, 2)
+    else:
+        sl      = round(max(highs_5m[-10:]), 2)
+        sl_dist = sl - price
+        tp1     = round(price - sl_dist, 2)
+        tp2     = round(price - sl_dist * 2, 2)
+        tp3     = round(price - sl_dist * 3, 2)
+
+    if sl_dist <= 0:
+        print("Invalid SL — skip")
+        return None
+
+    # Quality grade
+    if score >= 9:
+        quality  = "A+ — Strong Signal 🔥"
+        risk_pct = "1%"
+    elif score >= 7:
+        quality  = "A — Good Signal ✅"
+        risk_pct = "0.5%"
+    else:
+        quality  = "B — Weak"
+        risk_pct = "Skip"
+
+    return {
+        "direction":   direction,
+        "price":       price,
+        "sl":          sl,
+        "tp1":         tp1,
+        "tp2":         tp2,
+        "tp3":         tp3,
+        "score":       score,
+        "quality":     quality,
+        "risk_pct":    risk_pct,
+        "rsi":         rsi_val,
+        "vol_status":  vol_status,
+        "session":     session,
+        "priority":    priority,
+        "ema200_1h":   ema200_1h,
+        "ema20_15m":   ema20_15m,
+        "ema50_15m":   ema50_15m,
+        "ema200_15m":  ema200_15m,
+        "ema20_5m":    ema20_5m,
+        "ema50_5m":    ema50_5m,
+        "master_trend":master_trend,
+        "reasons":     reasons,
+    }
+
+# ─── FORMAT MESSAGE ───────────────────────────────────────
+def format_signal(sig):
     now_ist = datetime.now(IST).strftime("%d %b %Y | %I:%M %p IST")
-    emoji   = "🟢" if direction == "BUY" else "🔴"
-    quality = "A+ Strong" if score >= 8 else "B Good" if score >= 6 else "C Weak"
+    emoji   = "🟢" if sig["direction"] == "BUY" else "🔴"
 
     lines = [
-        f"{emoji} <b>BTCUSD — {direction} SIGNAL</b>",
-        "━━━━━━━━━━━━━━━━━━━━━",
-        f"📍 <b>Entry  :</b> ${price:,.2f}",
-        f"🛑 <b>SL     :</b> ${sl:,.2f}",
-        f"🎯 <b>TP1    :</b> ${tp1:,.2f}",
-        f"🎯 <b>TP2    :</b> ${tp2:,.2f}",
-        f"⚖️ <b>R:R    :</b> 1:{rr}",
-        "━━━━━━━━━━━━━━━━━━━━━",
-        f"📊 <b>Score  :</b> {score}/10",
-        f"⭐ <b>Quality:</b> {quality}",
-        f"📦 <b>Volume :</b> {vol_status}",
-        f"🕐 <b>Session:</b> {session} [{priority}]",
-        "━━━━━━━━━━━━━━━━━━━━━",
-        f"5M  → EMA30: {ema30_5m} | EMA50: {ema50_5m}",
-        f"15M → EMA30: {ema30_15m} | EMA50: {ema50_15m}",
-        "━━━━━━━━━━━━━━━━━━━━━",
-        "<b>Reasons:</b>",
+        f"{emoji} <b>BTCUSD — {sig['direction']} SIGNAL</b>",
+        f"📊 <b>Strategy: Paul Tudor Jones Method</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        f"📍 <b>Entry   :</b> ${sig['price']:,.2f}",
+        f"🛑 <b>SL      :</b> ${sig['sl']:,.2f}",
+        f"🎯 <b>TP1(1:1):</b> ${sig['tp1']:,.2f}",
+        f"🎯 <b>TP2(1:2):</b> ${sig['tp2']:,.2f}",
+        f"🎯 <b>TP3(1:3):</b> ${sig['tp3']:,.2f}",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        f"⭐ <b>Quality :</b> {sig['quality']}",
+        f"📊 <b>Score   :</b> {sig['score']}/10",
+        f"💰 <b>Risk    :</b> {sig['risk_pct']} of account",
+        f"📈 <b>RSI     :</b> {sig['rsi']}",
+        f"📦 <b>Volume  :</b> {sig['vol_status']}",
+        f"🕐 <b>Session :</b> {sig['session']} [{sig['priority']}]",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        f"📉 <b>1H  200 EMA:</b> ${sig['ema200_1h']:,.2f}",
+        f"📉 <b>15M 200 EMA:</b> ${sig['ema200_15m']:,.2f}",
+        f"📉 <b>15M  50 EMA:</b> ${sig['ema50_15m']:,.2f}",
+        f"📉 <b>15M  20 EMA:</b> ${sig['ema20_15m']:,.2f}",
+        f"📉 <b>5M   20 EMA:</b> ${sig['ema20_5m']:,.2f}",
+        f"📉 <b>5M   50 EMA:</b> ${sig['ema50_5m']:,.2f}",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        f"🌊 <b>Master Trend:</b> {sig['master_trend']} (1H)",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "<b>📋 Reasons:</b>",
     ]
-    for r in reasons:
+    for r in sig["reasons"]:
         lines.append(f"  {r}")
-    lines.append("━━━━━━━━━━━━━━━━━━━━━")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append("<b>📌 Trade Plan:</b>")
+    lines.append(f"  • TP1 hit → Close 50%, Move SL to BE")
+    lines.append(f"  • TP2 hit → Close 30%")
+    lines.append(f"  • TP3 hit → Close remaining 20%")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━")
     lines.append(f"🕐 {now_ist}")
-    lines.append("⚠️ <i>Risk 1% only. Confirm on chart.</i>")
+    lines.append(f"⚠️ <i>Risk {sig['risk_pct']} only. Always confirm on chart.</i>")
     return "\n".join(lines)
 
 # ─── MAIN LOOP ────────────────────────────────────────────
 def main():
-    print("🚀 BTCUSD EMA 30/50 Bot Started — Kraken API")
+    global consecutive_losses, bot_paused, bot_pause_until
+
+    print("🚀 Paul Tudor Jones BTCUSD Bot Started")
     send_telegram(
         "🚀 <b>BTCUSD Signal Bot Online!</b>\n"
-        "📊 EMA 30/50 | 15M + 5M\n"
-        "📡 Data: Kraken API\n"
-        "⏰ All day signals (except 12AM-6AM IST)\n"
-        "Checking every 5 minutes..."
+        "📊 <b>Strategy: Paul Tudor Jones Method</b>\n"
+        "📡 EMA 20/50/200 | RSI | Volume | Pullback\n"
+        "⏰ Signals all day (except 12AM-6AM IST)\n"
+        "🔔 Checking every 5 minutes..."
     )
-
-    last_signal    = {"time": None, "dir": None}
-    session_trades = {}
 
     while True:
         try:
-            session, priority = get_session()
             now     = datetime.now(IST)
             now_str = now.strftime("%H:%M")
 
+            # ── Bot paused check ──
+            if bot_paused and bot_pause_until:
+                if now < bot_pause_until:
+                    remaining = int((bot_pause_until - now).seconds / 60)
+                    print(f"[{now_str}] Bot paused — {remaining} min remaining")
+                    time.sleep(CHECK_INTERVAL)
+                    continue
+                else:
+                    bot_paused         = False
+                    bot_pause_until    = None
+                    consecutive_losses = 0
+                    send_telegram("✅ <b>Bot resumed after pause.</b>\nWatching for setups...")
+
+            # ── Session check ──
+            session, priority = get_session()
             if session is None:
                 print(f"[{now_str}] Dead zone — sleeping")
                 time.sleep(CHECK_INTERVAL)
                 continue
 
-            # Fetch candles from Kraken
-            closes_5m,  vols_5m,  highs_5m,  lows_5m  = get_btc_candles(5,  60)
-            closes_15m, vols_15m, highs_15m, lows_15m  = get_btc_candles(15, 60)
-
-            if closes_5m is None or closes_15m is None:
-                print(f"[{now_str}] Candle fetch failed — retry in 60s")
-                time.sleep(60)
-                continue
-
-            price = closes_5m[-1]
-
-            # Trend
-            trend, ema30_15m, ema50_15m = get_trend(closes_15m)
-            if not trend:
-                print(f"[{now_str}] Trend unclear — WAIT")
-                time.sleep(CHECK_INTERVAL)
-                continue
-
-            direction = "BUY" if trend == "BULLISH" else "SELL"
-
-            # Entry
-            entry_ok, ema30_5m, ema50_5m = check_entry(closes_5m, trend)
-
-            # Volume
-            vol_ok, cur_vol, avg_vol = check_volume(vols_5m)
-            vol_status = "Strong ✅" if vol_ok else "Weak ❌"
-
-            # Retest
-            retest = (abs(price - ema30_5m) / price * 100 < 0.2) if ema30_5m else False
-
-            # Score
-            score, reasons = calculate_score(priority, entry_ok, vol_ok, retest)
-
-            print(f"[{now_str}] BTC: ${price:,.0f} | {direction} | Score: {score}/10 | Entry: {entry_ok} | Vol: {vol_ok} | {session}")
-
-            # Min score
-            min_score = 6 if priority in ["HIGH", "MEDIUM"] else 8
-            if score < min_score or not entry_ok:
-                print(f"[{now_str}] Score {score} < {min_score} or entry not met — WAIT")
-                time.sleep(CHECK_INTERVAL)
-                continue
-
-            # Max 2 trades per session per day
+            # ── Max trades check ──
             key = f"{session}_{now.strftime('%Y%m%d')}"
             if session_trades.get(key, 0) >= 2:
-                print(f"[{now_str}] Max trades reached for {session}")
+                print(f"[{now_str}] Max 2 trades reached for {session}")
                 time.sleep(CHECK_INTERVAL)
                 continue
 
-            # Duplicate check 30 min
+            # ── Analyze ──
+            print(f"\n[{now_str}] Analyzing BTCUSD...")
+            signal = analyze()
+
+            if not signal:
+                print(f"[{now_str}] No valid setup — WAIT")
+                time.sleep(CHECK_INTERVAL)
+                continue
+
+            # ── Duplicate check (30 min) ──
             if (last_signal["time"] and
                 (now - last_signal["time"]).seconds < 1800 and
-                last_signal["dir"] == direction):
-                print(f"[{now_str}] Duplicate — skipped")
+                last_signal["dir"] == signal["direction"]):
+                print(f"[{now_str}] Duplicate signal — skipped")
                 time.sleep(CHECK_INTERVAL)
                 continue
 
-            # SL/TP
-            sl, tp1, tp2, rr = calculate_levels(trend, price, highs_5m, lows_5m)
-            if not sl:
-                print(f"[{now_str}] Invalid SL — skip")
-                time.sleep(CHECK_INTERVAL)
-                continue
-
-            # Send signal
-            msg = format_signal(
-                direction, price, sl, tp1, tp2, rr, score,
-                session, priority, ema30_5m, ema50_5m,
-                ema30_15m, ema50_15m, vol_status, reasons
-            )
+            # ── Send signal ──
+            msg = format_signal(signal)
             send_telegram(msg)
 
             last_signal["time"] = now
-            last_signal["dir"]  = direction
+            last_signal["dir"]  = signal["direction"]
             session_trades[key] = session_trades.get(key, 0) + 1
-            print(f"[{now_str}] ✅ Signal sent: {direction} @ ${price:,.0f}")
+
+            print(f"[{now_str}] ✅ Signal sent: {signal['direction']} @ ${signal['price']:,.0f} | Score: {signal['score']}/10")
 
         except Exception as e:
             print(f"Loop error: {e}")
